@@ -1,0 +1,15 @@
+
+# Ignore Sublime Text project files
+*.sublime-*
+
+# Added entries (1 items)
+__pycache__/
+
+# Added entries (1 items)
+config.toml
+
+# Added entries (1 items)
+.pt/
+
+# Added entries (1 items)
+*.log

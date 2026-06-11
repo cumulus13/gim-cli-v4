@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "gmail-monitor"
+version         = "2.0.0"
+description     = "Multi-account Gmail/IMAP CLI monitor with PostgreSQL history and Growl notifications"
+readme          = "README.md"
+requires-python = ">=3.11"
+license         = { text = "MIT" }
+authors         = [{ name = "Hadi Cahyadi", email = "cumulus13@gmail.com" }]
+keywords        = ["gmail", "imap", "monitor", "cli", "growl", "notifications"]
+
+dependencies = [
+    "typer[all]>=0.9",
+    "rich>=13",
+    "toml>=0.10",
+    "psycopg2-binary>=2.9",
+    "gntp>=1.0",
+]
+
+[project.scripts]
+gmail-monitor = "gmail_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gmail_monitor*"]

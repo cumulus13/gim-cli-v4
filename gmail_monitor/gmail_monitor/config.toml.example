@@ -1,0 +1,61 @@
+# Gmail CLI Monitor Configuration
+
+# Email Accounts
+[[accounts]]
+email = "cumulus13@gmail.com"
+password = "xxxx xxxx xxxx xxxx"
+imap_server = "imap.gmail.com"
+imap_port = 993
+enabled = true
+
+[[accounts]]
+email = "hacker999@gmail.com"
+password = "xxxx xxxx xxxx xxxx"
+imap_server = "imap.gmail.com"
+imap_port = 993
+enabled = true
+
+[[accounts]]
+email = "satan666@gmail.com"
+password = "xxxx xxxx xxxx xxxx"
+imap_server = "imap.gmail.com"
+imap_port = 993
+enabled = true
+# Yahoo Mail Example
+# [[accounts]]
+# email = "user@yahoo.com"
+# password = "your-app-password-here"
+# imap_server = "imap.mail.yahoo.com"
+# imap_port = 993
+
+# # Custom Email Server Example
+# [[accounts]]
+# email = "user@example.com"
+# password = "your-password"
+# imap_server = "mail.example.com"
+# imap_port = 993
+
+# Database Configuration
+[database]
+host = "192.168.108.212"
+port = 5432
+database = "gim"
+user = "gim_admin"
+password = "fuckme"
+
+# Growl Notification Settings
+[growl]
+host = "localhost"
+port     = 23053
+password = ""  # Leave empty if no password
+
+# Monitoring Settings
+[monitoring]
+check_interval = 30  # Check every 45 seconds
+max_emails_per_check = 10  # Maximum emails to fetch per check
+reconnect_delay       = 30   # seconds to wait before reconnect attempt
+max_reconnect_attempts = 5   # 0 = unlimited
+
+[logging]
+level = "INFO"          # DEBUG | INFO | WARNING | ERROR
+file  = "gmail_monitor.log"
