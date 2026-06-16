@@ -16,7 +16,10 @@ from psycopg2 import sql
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from psycopg2.extras import RealDictCursor
 
-from .models import EmailAccount, EmailMessage
+try:
+    from .models import EmailAccount, EmailMessage
+except:
+    from models import EmailAccount, EmailMessage  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +194,16 @@ class DatabaseManager:
     # ------------------------------------------------------------------
     # Email history
     # ------------------------------------------------------------------
+
+    def is_known(self, message_id: str) -> bool:
+        """Return True if this message_id is already in email_history."""
+        assert self.conn is not None
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM email_history WHERE message_id = %s LIMIT 1",
+                (message_id,),
+            )
+            return cur.fetchone() is not None
 
     def save_email(self, msg: EmailMessage) -> bool:
         """

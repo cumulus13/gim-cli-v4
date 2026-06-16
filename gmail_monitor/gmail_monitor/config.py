@@ -15,8 +15,12 @@ from typing import Any, Dict, List, Optional
 
 import toml
 
-from .db import DatabaseManager
-from .models import EmailAccount
+try:
+    from .db import DatabaseManager
+    from .models import EmailAccount
+except:
+    from db import DatabaseManager  # type: ignore
+    from models import EmailAccount  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +40,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "monitoring": {
         "check_interval": 60,
-        "max_emails_per_check": 10,
+        "max_emails_per_check": 50,
         "reconnect_delay": 30,
         "max_reconnect_attempts": 0,   # 0 = unlimited
         "mark_as_read": True,
+        "socket_timeout": 60,          # seconds — prevents indefinite hangs
     },
     "logging": {
         "level": "INFO",
@@ -85,10 +90,12 @@ password = ""
 # ── Monitor behaviour ───────────────────────────
 [monitoring]
 check_interval         = 60    # seconds between IMAP checks
-max_emails_per_check   = 10    # max unseen emails processed per cycle
+max_emails_per_check   = 50    # per-cycle cap (oldest-first; remainder on next cycle)
 reconnect_delay        = 30    # base seconds before reconnect (exponential backoff)
 max_reconnect_attempts = 0     # 0 = unlimited retries (recommended)
-mark_as_read           = true  # mark messages \\Seen on server after fetching
+mark_as_read           = true  # mark messages Seen on server after fetching
+socket_timeout         = 60    # seconds — IMAP socket read timeout (prevents
+                                # indefinite hangs if a connection dies silently)
 
 # ── Logging ─────────────────────────────────────
 [logging]
@@ -168,9 +175,11 @@ class ConfigManager:
             )
         mon = self._cfg.get("monitoring", {})
         self.db.set_config("check_interval", str(mon.get("check_interval", 60)))
-        self.db.set_config("max_emails_per_check", str(mon.get("max_emails_per_check", 10)))
+        self.db.set_config("max_emails_per_check", str(mon.get("max_emails_per_check", 50)))
         self.db.set_config("reconnect_delay", str(mon.get("reconnect_delay", 30)))
-        self.db.set_config("max_reconnect_attempts", str(mon.get("max_reconnect_attempts", 5)))
+        self.db.set_config("max_reconnect_attempts", str(mon.get("max_reconnect_attempts", 0)))
+        self.db.set_config("mark_as_read", str(mon.get("mark_as_read", True)))
+        self.db.set_config("socket_timeout", str(mon.get("socket_timeout", 60)))
         growl = self._cfg.get("growl", {})
         self.db.set_config("growl_host", growl.get("host", "localhost"))
         self.db.set_config("growl_port", str(growl.get("port", 23053)))
@@ -234,9 +243,11 @@ class ConfigManager:
             return default if v is None else v
 
         cfg["monitoring"]["check_interval"] = int(_get("check_interval", 60))
-        cfg["monitoring"]["max_emails_per_check"] = int(_get("max_emails_per_check", 10))
+        cfg["monitoring"]["max_emails_per_check"] = int(_get("max_emails_per_check", 50))
         cfg["monitoring"]["reconnect_delay"] = int(_get("reconnect_delay", 30))
-        cfg["monitoring"]["max_reconnect_attempts"] = int(_get("max_reconnect_attempts", 5))
+        cfg["monitoring"]["max_reconnect_attempts"] = int(_get("max_reconnect_attempts", 0))
+        cfg["monitoring"]["mark_as_read"] = str(_get("mark_as_read", "True")).lower() == "true"
+        cfg["monitoring"]["socket_timeout"] = int(_get("socket_timeout", 60))
         cfg["growl"]["host"] = _get("growl_host", "localhost")
         cfg["growl"]["port"] = int(_get("growl_port", 23053))
         cfg["growl"]["password"] = _get("growl_password", "")

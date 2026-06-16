@@ -45,6 +45,8 @@ from .models import EmailAccount, EmailMessage
 from .monitor import EmailMonitor
 from .notifier import GrowlNotifier
 
+logger = logging.getLogger(__name__)
+
 app = typer.Typer(
     name="gmail-monitor",
     help="Multi-account email monitor with Growl notifications.",
@@ -77,12 +79,16 @@ def _setup_logging(level: str = "INFO", logfile: str = "gmail_monitor.log") -> N
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _build_app(cfg: dict) -> tuple[DatabaseManager, ConfigManager, GrowlNotifier]:
+def _build_app(cfg: dict) -> tuple[DatabaseManager, ConfigManager, dict, GrowlNotifier]:
     """Bootstrap DB, config manager, and notifier from a db-config dict.
 
     ``cfg`` is already the database sub-dict returned by bootstrap_db_config()
     (keys: host/port/database/user/password).  Pass it straight through —
     do NOT call .get("database") on it again or you get the DB name string.
+
+    Returns (db, cm, full_cfg, notifier) — full_cfg is returned so the caller
+    does not need to call cm.load() a second time (which re-reads the file and
+    logs "Loading config" again unnecessarily).
     """
     db = DatabaseManager(cfg)
     db.connect()
@@ -94,7 +100,7 @@ def _build_app(cfg: dict) -> tuple[DatabaseManager, ConfigManager, GrowlNotifier
     cm.sync_to_db()
 
     notifier = GrowlNotifier(full_cfg.get("growl", {}))
-    return db, cm, notifier
+    return db, cm, full_cfg, notifier
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -108,6 +114,10 @@ def monitor(
         None, "--config", "-c", help="Path to config.toml (default: ./config.toml)"
     ),
     log_level: str = typer.Option("INFO", "--log-level", "-l", help="Log level"),
+    reload_interval: int = typer.Option(
+        30, "--reload-interval", "-r",
+        help="Seconds between config-file checks for hot-reload. 0 disables hot-reload.",
+    ),
 ):
     """[bold green]Start monitoring all enabled accounts.[/bold green]"""
     if config_file:
@@ -116,15 +126,17 @@ def monitor(
     print_banner(__version__)
 
     db_cfg = bootstrap_db_config()
+    # Setup logging BEFORE _build_app so early log messages (DB connect,
+    # config load) go to the configured handlers, not the default stderr handler.
     _setup_logging(log_level)
 
     try:
-        db, cm, notifier = _build_app(db_cfg)
+        db, cm, cfg, notifier = _build_app(db_cfg)
     except Exception as exc:
         console.print(f"[red]✗ Startup failed: {exc}[/red]")
         raise typer.Exit(1)
 
-    cfg = cm.load()
+    # cfg already loaded by _build_app — no second cm.load() needed
     accounts = cm.get_accounts()
 
     if not accounts:
@@ -148,25 +160,52 @@ def monitor(
             db=db,
             notifier=notifier,
             check_interval=mon_cfg.get("check_interval", 60),
-            max_emails=mon_cfg.get("max_emails_per_check", 10),
+            max_emails=mon_cfg.get("max_emails_per_check", 50),
             reconnect_delay=mon_cfg.get("reconnect_delay", 30),
             max_reconnect_attempts=mon_cfg.get("max_reconnect_attempts", 0),
             mark_as_read=mon_cfg.get("mark_as_read", True),
+            socket_timeout=mon_cfg.get("socket_timeout", 60),
             on_new_email=_on_new_email,
         )
         for acc in accounts
     ]
 
-    asyncio.run(_run_monitors(monitors, db))
+    asyncio.run(_run_monitors(monitors, db, cm, mon_cfg, notifier, reload_interval))
 
 
-async def _run_monitors(monitors: list[EmailMonitor], db: DatabaseManager) -> None:
-    """Run all monitor coroutines concurrently with clean signal handling."""
+async def _run_monitors(
+    monitors: list[EmailMonitor],
+    db: DatabaseManager,
+    cm: ConfigManager,
+    mon_cfg: dict,
+    notifier: GrowlNotifier,
+    reload_interval: int = 30,
+) -> None:
+    """
+    Run all monitor coroutines concurrently with clean signal handling
+    and optional hot-reload of config.toml.
+
+    Hot-reload behaviour (reload_interval > 0)
+    -------------------------------------------
+    Every ``reload_interval`` seconds, check config.toml's mtime.  If it
+    changed:
+      - accounts added in config.toml  -> new EmailMonitor + task started
+      - accounts removed / disabled    -> existing monitor stopped & dropped
+      - accounts still present         -> credentials/server applied live
+                                           (forces reconnect only if changed)
+      - [monitoring] section changes   -> applied live to ALL monitors via
+                                           update_settings() (no restart)
+
+    reload_interval = 0 disables hot-reload entirely (legacy behaviour).
+    """
     loop = asyncio.get_running_loop()
+    shutdown_requested = False
 
     def _shutdown(sig_name: str):
+        nonlocal shutdown_requested
         console.print(f"\n[yellow]Received {sig_name} — shutting down…[/yellow]")
-        for m in monitors:
+        shutdown_requested = True
+        for m in monitor_by_email.values():
             m.stop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -176,8 +215,139 @@ async def _run_monitors(monitors: list[EmailMonitor], db: DatabaseManager) -> No
             # Windows doesn't support add_signal_handler for all signals
             pass
 
+    # Track monitors by account email so we can diff on reload
+    monitor_by_email: dict[str, EmailMonitor] = {m.account.email: m for m in monitors}
+    tasks: dict[str, asyncio.Task] = {
+        email: asyncio.create_task(m.run(), name=f"monitor:{email}")
+        for email, m in monitor_by_email.items()
+    }
+
+    last_mtime: Optional[float] = None
     try:
-        await asyncio.gather(*[m.run() for m in monitors])
+        cfg_path = cm.CONFIG_FILE
+        if cfg_path.exists():
+            last_mtime = cfg_path.stat().st_mtime
+    except OSError:
+        pass
+
+    try:
+        while not shutdown_requested:
+            # Wait reload_interval seconds OR until all tasks finish,
+            # whichever comes first.
+            if not tasks:
+                # No tasks running — wait a bit then check for reload or shutdown
+                await asyncio.sleep(reload_interval if reload_interval > 0 else 5)
+            elif reload_interval > 0:
+                done, _ = await asyncio.wait(
+                    tasks.values(),
+                    timeout=reload_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            else:
+                done, _ = await asyncio.wait(
+                    tasks.values(), return_when=asyncio.ALL_COMPLETED
+                )
+
+            # Remove finished tasks (monitor gave up permanently, or stopped)
+            for email, task in list(tasks.items()):
+                if task.done():
+                    exc = task.exception() if not task.cancelled() else None
+                    if exc:
+                        logger.error("Monitor for %s crashed: %s", email, exc)
+                    else:
+                        logger.info("Monitor for %s stopped", email)
+                    del tasks[email]
+                    monitor_by_email.pop(email, None)
+
+            if shutdown_requested:
+                break
+
+            if not tasks:
+                # All monitors gave up / stopped and hot-reload is off,
+                # or every account was removed via hot-reload.
+                if reload_interval == 0:
+                    console.print("[yellow]All monitors have stopped.[/yellow]")
+                    break
+                # With hot-reload on, keep the process alive — the user may
+                # fix config.toml (e.g. bad credentials) and we'll pick the
+                # account back up on the next reload tick below.
+
+            if reload_interval <= 0:
+                continue
+
+            # ── Hot-reload check ────────────────────────────────────────
+            try:
+                cfg_path = cm.CONFIG_FILE
+                if not cfg_path.exists():
+                    continue
+                mtime = cfg_path.stat().st_mtime
+                if last_mtime is not None and mtime == last_mtime:
+                    continue
+                last_mtime = mtime
+
+                console.print(f"[cyan]↻ config.toml changed — reloading…[/cyan]")
+                new_cfg = cm.load()
+                cm.sync_to_db()
+                new_mon_cfg = new_cfg.get("monitoring", {})
+                new_accounts = {a.email: a for a in cm.get_accounts()}
+
+                # 1. Stop monitors for accounts removed/disabled.
+                # Signal stop() and drop from monitor_by_email immediately
+                # so the active-count below is accurate; the task itself
+                # is reaped from `tasks` on the next asyncio.wait() pass.
+                for email in list(monitor_by_email.keys()):
+                    if email not in new_accounts:
+                        console.print(f"[yellow]  − removing account {email}[/yellow]")
+                        monitor_by_email[email].stop()
+                        del monitor_by_email[email]
+
+                # 2. Update existing monitors (settings + possible credential change)
+                for email, account in new_accounts.items():
+                    if email in monitor_by_email:
+                        m = monitor_by_email[email]
+                        m.apply_account(account)
+                        m.update_settings(
+                            check_interval=new_mon_cfg.get("check_interval"),
+                            max_emails=new_mon_cfg.get("max_emails_per_check"),
+                            reconnect_delay=new_mon_cfg.get("reconnect_delay"),
+                            max_reconnect_attempts=new_mon_cfg.get("max_reconnect_attempts"),
+                            mark_as_read=new_mon_cfg.get("mark_as_read"),
+                            socket_timeout=new_mon_cfg.get("socket_timeout"),
+                        )
+
+                # 3. Start monitors for newly added accounts
+                for email, account in new_accounts.items():
+                    if email not in monitor_by_email:
+                        console.print(f"[green]  + adding account {email}[/green]")
+                        new_monitor = EmailMonitor(
+                            account=account,
+                            db=db,
+                            notifier=notifier,
+                            check_interval=new_mon_cfg.get("check_interval", 60),
+                            max_emails=new_mon_cfg.get("max_emails_per_check", 50),
+                            reconnect_delay=new_mon_cfg.get("reconnect_delay", 30),
+                            max_reconnect_attempts=new_mon_cfg.get("max_reconnect_attempts", 0),
+                            mark_as_read=new_mon_cfg.get("mark_as_read", True),
+                            socket_timeout=new_mon_cfg.get("socket_timeout", 60),
+                            on_new_email=_on_new_email,
+                        )
+                        monitor_by_email[email] = new_monitor
+                        tasks[email] = asyncio.create_task(
+                            new_monitor.run(), name=f"monitor:{email}"
+                        )
+
+                console.print(
+                    f"[cyan]↻ reload complete — {len(monitor_by_email)} account(s) active[/cyan]"
+                )
+
+            except Exception as exc:
+                logger.exception("Hot-reload failed: %s", exc)
+                console.print(f"[red]✗ Hot-reload error: {exc}[/red]")
+
+        # ── Shutdown: wait for all remaining tasks to finish cleanly ──────
+        if tasks:
+            await asyncio.wait(tasks.values(), timeout=30)
+
     finally:
         db.close()
         console.print("[green]✓ Goodbye![/green]")
